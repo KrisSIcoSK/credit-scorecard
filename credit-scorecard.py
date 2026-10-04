@@ -16,12 +16,33 @@ from statsmodels.stats.outliers_influence import variance_inflation_factor
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定默认字体为黑体
 plt.rcParams['axes.unicode_minus'] = False    # 解决保存图像是负号'-'显示为方块的问题
 
-DATA_PATH = r'E:\统计学习\数据集\信贷项目\default of credit card clients.xls'
+# 数据文件路径：按顺序查找，用第一个存在的路径
+# ① 脚本同级目录（推荐：把 .xls 和脚本放一起，别人 clone 后也能直接跑）
+# ② 脚本同级的 data/ 子目录
+# ③ 本机原始存放路径
+DATA_FILE = 'default of credit card clients.xls'
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CANDIDATE_PATHS = [
+    os.path.join(_SCRIPT_DIR, DATA_FILE),
+    os.path.join(_SCRIPT_DIR, 'data', DATA_FILE),
+    r'E:\统计学习\数据集\信贷项目\default of credit card clients.xls',
+]
+DATA_PATH = next((p for p in CANDIDATE_PATHS if os.path.exists(p)), None)
 # 【新增】输出目录：默认放在脚本同级的 outputs 文件夹，图表和结果表统一落盘，避免画完就丢。
 # 用脚本自身路径而不是写死绝对路径，换电脑/换目录都不用改代码。
 OUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'outputs')
 os.makedirs(OUT_DIR, exist_ok=True)
 
+# 找不到数据文件时给出明确提示，而不是抛一堆 traceback
+if DATA_PATH is None:
+    raise FileNotFoundError(
+        '找不到数据文件：' + DATA_FILE + '\n'
+        '请从 https://archive.ics.uci.edu/dataset/350 下载 '
+        '"default of credit card clients.xls"，\n'
+        '放到脚本同级目录（或 data/ 子目录）即可；\n'
+        '也可以修改脚本顶部的 CANDIDATE_PATHS 指向你的实际路径。'
+    )
+print('数据文件：', DATA_PATH)
 df=pd.read_excel(DATA_PATH,header=1)
 # 设置显示格式(调试时使用)
 pd.set_option('display.max_columns', None)
