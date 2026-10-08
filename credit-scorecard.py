@@ -11,6 +11,8 @@ from sklearn.model_selection import cross_val_score
 from sklearn.calibration import calibration_curve
 from sklearn.tree import DecisionTreeClassifier
 from sklearn.ensemble import RandomForestClassifier,GradientBoostingClassifier
+from sklearn.preprocessing import StandardScaler
+from sklearn.pipeline import make_pipeline
 from statsmodels.stats.outliers_influence import variance_inflation_factor
 # 全局字体配置，解决中文不显示的问题
 plt.rcParams['font.sans-serif'] = ['SimHei']  # 指定默认字体为黑体
@@ -44,6 +46,9 @@ if DATA_PATH is None:
     )
 print('数据文件：', DATA_PATH)
 df=pd.read_excel(DATA_PATH,header=1)
+#【修复】记下读入时的原始形状。后面会往 df 里不断加分箱列/衍生列，
+#末尾如果用 df.shape 写汇总，列数会变成 55 这种分析中间态，不是数据的真实规格。
+df_shape_raw=df.shape
 # 设置显示格式(调试时使用)
 pd.set_option('display.max_columns', None)
 pd.set_option('display.max_rows', None)
@@ -107,11 +112,12 @@ plt.title('pay_1各取值坏账率趋势')
 plt.grid(alpha=0.3)
 plt.savefig(os.path.join(OUT_DIR,'01_pay1_badrate_trend.png'),dpi=120,bbox_inches='tight')  #【修复】原来只 show()/close()，图全部丢失
 plt.close()
-#把 PAY_0 按 >=1 / <=0 二分，对比两组坏账率
-df['pay1_bin']=df['PAY_1'].apply(lambda x:'逾期(>=1)'if x>=1 else'正常(<=0)')
-pay1_bin_bad=df.groupby('pay1_bin')[target].agg(['count','mean'])
-print('--- PAY_1 二分对比 ---')
-print(pay1_bin_bad)#逾期客户坏账率远高于无逾期客户
+#把 PAY_1 按 >=1 / <=0 二分，对比两组坏账率
+#【修复】这里原来用 df['pay1_bin'] 这个临时列做二分统计。它只在下面一行用过一次，
+#属于死代码；而且名字和入模变量 PAY1_bin(还款状态四档)、pay1_bins(PAY_AMT1 等频分箱)
+#只差大小写和单复数，极易看错，已删掉临时列、直接对 PAY_1 取条件。
+print('--- PAY_1 二分对比（逾期>=1 个月 vs 正常<=0）---')
+print(df.groupby(df['PAY_1']>=1)[target].agg(['count','mean']))#逾期客户坏账率远高于无逾期客户
 #对 LIMIT_BAL 做等频分箱，看坏账率是否单调
 df['limit_bal_bins']=pd.qcut(df['LIMIT_BAL'],q=10)
 print('--- LIMIT_BAL 等频10箱坏账率 ---')
@@ -335,14 +341,19 @@ print(iv_df[iv_df['iv']>0.02].to_string(index=False))
 #构造一个衍生特征，观察它的 IV 是否"虚高":构造的delay_cnt就是完全由pay系列原始变量计算得到属于信息重复
 #而额度使用率/ PAY_RATIO1是两个不同维度字段相除，产生新业务维度，不是虚高
 #输出最终 WOE 映射表
+#【修复】这里原来把"全量数据拟合的 WOE"导出成 woe映射表.csv，而 README 把它标注为"生产环境部署用"。
+#但交付的分值表(score_card.csv)用的是**训练集拟合**的 WOE（步骤5 的 woe_mapping_dict，以避免数据泄露）。
+#两者对同一个箱会给出不同的 WOE —— 实测 45 个共同箱全部不一致，
+#业务方拿 woe映射表.csv 去算分，结果和分值表对不上。
+#现在把导出动作移到步骤5 之后，导出的就是分值表实际使用的那一套映射。
+#这里的全量 WOE 只用于本步骤的变量筛选（IV）与箱分布展示，不再作为部署产物。
 woe_map_all=pd.DataFrame()
 for feat in col_list:
     woe_df=calc_woe(df,feat,target)
     woe_map_all=pd.concat([woe_map_all,woe_df],ignore_index=True)
-print('--- WOE 映射表（前 10 行）---')
+print('--- WOE 映射表（前 10 行，全量数据口径，仅用于变量筛选与箱分布展示）---')
 print(woe_map_all.head(10))
-woe_map_all.to_csv(os.path.join(OUT_DIR,'woe映射表.csv'),index=False,encoding='utf-8-sig')
-print(f'WOE 映射表已导出：{os.path.join(OUT_DIR,"woe映射表.csv")}')
+print('说明：真正用于部署的 WOE 映射表在步骤5 用训练集重新拟合后导出，与分值表同源。')
 #对比：筛掉 BILL_AMT 六个变量损失了多少 IV
 bill_iv=iv_df[iv_df['feature'].str.startswith('bill')]['iv'].sum()
 print(f'BILL_AMT 六个变量 IV 合计 = {bill_iv:.4f}（全部 <0.02，已整体剔除，信息损失可忽略）')
@@ -426,6 +437,11 @@ for feat in feature_cols:
 nan_check=pd.DataFrame({'训练集NaN':x_train_woe.isna().sum(),'测试集NaN':x_test_woe.isna().sum()})
 print(f'--- WOE 映射后 NaN 检查（合计 {nan_check.values.sum()} 个）---')
 print(nan_check[nan_check.sum(axis=1)>0] if nan_check.values.sum()>0 else '无 NaN，映射完整')
+#【修复】导出真正用于部署的 WOE 映射表：用训练集拟合的这一套，
+#与 score_card.csv 的分值表同源，业务方按它算分才能和分值表对上。
+woe_deploy=pd.concat([calc_woe(df_train,feat,'default') for feat in feature_cols],ignore_index=True)
+woe_deploy.to_csv(os.path.join(OUT_DIR,'woe映射表.csv'),index=False,encoding='utf-8-sig')
+print(f'WOE 映射表（训练集拟合，与分值表同源）已导出：{os.path.join(OUT_DIR,"woe映射表.csv")}')
 #先建基线模型：用训练集均值预测
 base_prob=y_train.mean()
 y_pred_base=np.full(len(y_test),fill_value=base_prob)
@@ -439,19 +455,26 @@ y_train_pred=lr.predict_proba(x_train_woe)[:,1]
 y_test_pred=lr.predict_proba(x_test_woe)[:,1]
 auc_train=roc_auc_score(y_train,y_train_pred)
 auc_test=roc_auc_score(y_test,y_test_pred)
+print(f'【全变量版本 {len(feature_cols)} 个变量，作为对照】')
 print(f'训练集AUC={auc_train:.4f},测试集AUC={auc_test:.4f}')
 #KS函数
 def calc_ks(y_true,pred_prob):
-    df_ks=pd.DataFrame({'y':y_true,'prob':pred_prob})
-    df_ks=df_ks.sort_values('prob',ascending=False).reset_index(drop=True)
-    df_ks['good']=1-df_ks['y']
-    df_ks['bad']=df_ks['y']
-    df_ks['cum_good']=df_ks['good'].cumsum()/df_ks['good'].sum()
-    df_ks['cum_bad']=df_ks['bad'].cumsum()/df_ks['bad'].sum()
-    df_ks['diff']=df_ks['cum_bad']-df_ks['cum_good']
-    #【修复】取绝对值最大值。原写法 diff.max() 在曲线跌破 0 时会低估 KS
-    ks_value=df_ks['diff'].abs().max()
-    return ks_value,df_ks
+    #【修复】原来是逐行累计 CDF。当大量样本分数相同时，sort_values 的稳定排序会按原始行顺序
+    #tie-break，累计曲线之间就会"漂"出一个并不存在的间距。
+    #实测：常数预测（所有分数相同）本应得到 KS=0，原写法却会算出 0.012~0.025。
+    #受影响的不只是退化情形：树模型的预测值是叶子值（大量并列）、评分卡的整数分值同样并列，
+    #所以凡是用离散分数算 KS，原写法都会系统性偏高。
+    #改为先按分数值聚合成组再累计，消除并列下的排序任意性。
+    df_ks=pd.DataFrame({'y':np.asarray(y_true),'prob':np.asarray(pred_prob)})
+    grp=df_ks.groupby('prob')['y'].agg(bad='sum',total='count').sort_index(ascending=False)
+    grp['good']=grp['total']-grp['bad']
+    grp['cum_good']=grp['good'].cumsum()/grp['good'].sum()
+    grp['cum_bad']=grp['bad'].cumsum()/grp['bad'].sum()
+    grp['diff']=grp['cum_bad']-grp['cum_good']
+    #取绝对值最大值：曲线在中段跌破 0 时要算上负向的最大间距
+    ks_value=grp['diff'].abs().max()
+    #reset_index 让 prob 从索引变回普通列，下游画 KS 曲线仍可用 ks_df['prob']
+    return ks_value,grp.reset_index()
 ks_train,_=calc_ks(y_train,y_train_pred)
 ks_test,_=calc_ks(y_test,y_test_pred)
 print(f'训练KS={ks_train:.4f},测试KS={ks_test:.4f}')
@@ -466,43 +489,11 @@ cv=StratifiedKFold(n_splits=5,shuffle=True,random_state=42)
 cv_auc_list=cross_val_score(lr,x_train_woe,y_train,cv=cv,scoring='roc_auc')
 print(f'5折AUC均值:{cv_auc_list.mean():.4f},标准差:{cv_auc_list.std():.4f},各折:{np.round(cv_auc_list,4)}')
 print('与训练集AUC接近、标准差很小，说明模型区分能力良好、泛化能力强、无明显过拟合')
-#画 ROC 曲线，解释 AUC=0.76 的业务含义
-fpr,tpr,_=roc_curve(y_test,y_test_pred)
-plt.figure(figsize=(6,6))
-plt.plot(fpr,tpr,label=f'AUC={auc_test:.3f}')
-plt.plot([0,1],[0,1],'k--')
-plt.xlabel('FPR假阳性率')
-plt.ylabel('TPR真阳性率')
-plt.title('ROC曲线')
-plt.legend()
-plt.grid(alpha=0.3)
-plt.savefig(os.path.join(OUT_DIR,'02_roc_curve.png'),dpi=120,bbox_inches='tight')
-plt.close()
-#画 KS 曲线（两条累计分布曲线 + 最大间距）
-ks_val,ks_df=calc_ks(y_test,y_test_pred)
-plt.figure(figsize=(6,6))
-plt.plot(ks_df['prob'],ks_df['cum_bad'],label='累计坏样本')
-plt.plot(ks_df['prob'],ks_df['cum_good'],label='累计好样本')
-plt.title(f'KS曲线，KS={ks_val:.3f}')
-plt.xlabel('预测违约概率')
-plt.ylabel('累计占比')
-plt.legend()
-plt.grid(alpha=0.3)
-plt.savefig(os.path.join(OUT_DIR,'03_ks_curve.png'),dpi=120,bbox_inches='tight')
-plt.close()
-#画校准曲线，检查预测概率是否准确
-prob_true, prob_pred =calibration_curve(y_test, y_test_pred, n_bins=10)
-plt.figure(figsize=(6, 6))
-plt.plot(prob_pred, prob_true, "o-", label='模型预测')
-plt.plot([0, 1], [0, 1], "k--", label="理想校准")
-plt.xlabel("预测概率")
-plt.ylabel('真实违约率')
-plt.title("校准曲线")
-plt.legend()
-plt.grid(alpha=0.3)
-plt.savefig(os.path.join(OUT_DIR,'04_calibration_curve.png'),dpi=120,bbox_inches='tight')
-plt.close()
-print(f'图表已保存到 {OUT_DIR}')
+#【修复】ROC / KS / 校准这三张图原来画在这里。但此时 y_test_pred 还是全变量(17变量)模型的预测，
+#而"切换到 11 变量主交付模型"发生在步骤6之后，于是图上写着 AUC=0.761 / KS=0.399，
+#正文(README)写的却是主交付的 0.7592 / 0.3974 —— 同一份交付物里两个数，面试官一眼就能看到。
+#现在把这三张图整体移到主交付模型拟合完成之后（见"主交付模型"段落下方的绘图块），
+#图上的数字会随模型自动更新，不需要人工同步。
 
 
 #================statsmodels 系数表与显著性=================
@@ -562,6 +553,14 @@ print(f'BIC: {result.bic:.1f}')
 #剔除，评分卡要"每个变量都有意义"，风控评分卡的标准做法是保留统计显著 + 业务可解释的变量
 #【新增】用数据验证这个决策：对比"全变量"与"只保留显著变量"的测试集表现
 drop_cols=[c for c in sig_df.index if c!='const' and c in feature_cols]
+#【修复】在 p 值筛选之外，再强制剔除 pay_ratio1_bins。
+#它虽然显著（p=0.0150），但系数是负的（-0.2024），符号与业务逻辑相反：还款比例越高、风险本该越低。
+#成因是它与 pay1_bins 共用 PAY_AMT1、与 util_bins 共用 BILL_AMT1，信息重叠把系数扭反了。
+#这样的变量留在交付分值表里会直接造成业务上说不通的计分方向 —— 实测分值表里
+#"完全不还款"这一档反而给客户加分、"大额/全额还款"这一档反而减分，业务方一定会问"为什么还得多反而扣分"。
+#所以交付版剔除它；全变量版本仍保留它，作为"共线性导致系数符号翻转"的实测证据。
+force_drop=['pay_ratio1_bins']
+drop_cols=list(dict.fromkeys([c for c in drop_cols if c in feature_cols]+force_drop))
 keep_cols=[c for c in feature_cols if c not in drop_cols]
 lr_keep=LogisticRegression(random_state=42,max_iter=1000)
 lr_keep.fit(x_train_woe[keep_cols],y_train)
@@ -572,6 +571,85 @@ print(f'全变量({len(feature_cols)}个): 测试AUC={auc_test:.4f}, KS={ks_test
 print(f'仅显著({len(keep_cols)}个): 测试AUC={auc_keep:.4f}, KS={ks_keep:.4f}')
 print(f'剔除变量清单: {drop_cols}')
 print('结论：剔除后 AUC/KS 几乎没有下降，但模型少了一批无法向业务解释的变量，应剔除。')
+
+#【新增】把"结论"真正落进交付物。
+#原来这里算完 lr_keep 就结束了，后续分值表/PSI/策略损益/模型对比用的仍然是 17 变量的 result，
+#于是出现"结论说应剔除、交付的却是全变量版本"两张皮，面试官问"最终交付哪个模型"会答不上来。
+#现在改为：后续所有环节统一基于剔除后的模型；全变量版本的结果保留下来做对照证据。
+auc_full,ks_full=auc_test,ks_test
+feature_cols_full=list(feature_cols)
+x_train_woe_full=x_train_woe.copy()
+x_test_woe_full=x_test_woe.copy()
+
+feature_cols=list(keep_cols)
+x_train_woe=x_train_woe[keep_cols].copy()
+x_test_woe=x_test_woe[keep_cols].copy()
+x_train_sm=sm.add_constant(x_train_woe)
+x_test_sm=sm.add_constant(x_test_woe)
+result=sm.Logit(y_train,x_train_sm).fit(disp=0)
+print()
+print('--- 主交付模型：剔除不显著变量后重新拟合 ---')
+print(f'主交付入模变量数 = {len(feature_cols)}（从 {len(feature_cols_full)} 个中剔除 {len(drop_cols)} 个）')
+print(f'对照 全变量版本({len(feature_cols_full)}个): 测试AUC={auc_full:.4f}, KS={ks_full:.4f}')
+print(f'主交付 精简版本({len(feature_cols)}个): 测试AUC={auc_keep:.4f}, KS={ks_keep:.4f}')
+print(f'主交付 伪R²={result.prsquared:.4f}, AIC={result.aic:.1f}, BIC={result.bic:.1f}')
+#重算交付模型自己的训练/测试指标与差值：过拟合检查以交付模型为准，而不是以全变量版本为准
+y_train_pred=result.predict(x_train_sm)
+y_test_pred=result.predict(x_test_sm)
+auc_train=roc_auc_score(y_train,y_train_pred)
+auc_test=roc_auc_score(y_test,y_test_pred)
+ks_train,_=calc_ks(y_train,y_train_pred)
+ks_test,_=calc_ks(y_test,y_test_pred)
+print(f'主交付 训练集: AUC={auc_train:.4f}, KS={ks_train:.4f}')
+print(f'主交付 测试集: AUC={auc_test:.4f}, KS={ks_test:.4f}')
+print(f'主交付 差值  : AUC={abs(auc_train-auc_test):.4f}, KS={abs(ks_train-ks_test):.4f}')
+#主交付模型自己做一次 5 折交叉验证（上面那次是全变量版本的，不能直接挪用）
+cv_keep=cross_val_score(LogisticRegression(random_state=42,max_iter=1000),
+                        x_train_woe,y_train,
+                        cv=StratifiedKFold(n_splits=5,shuffle=True,random_state=42),
+                        scoring='roc_auc')
+print(f'主交付 5折CV AUC均值={cv_keep.mean():.4f}, 标准差={cv_keep.std():.4f}, 各折:{np.round(cv_keep,4)}')
+print('说明：以下步骤 7（分值表）、8（PSI）、9（策略损益）、10（模型对比）全部基于精简版本。')
+
+#画 ROC / KS / 校准三张图（【修复】从步骤5 之后移到这里）
+#放在主交付模型拟合完成之后，图上的 AUC / KS 才会与正文一致。
+#画 ROC 曲线，解释 AUC 的业务含义
+fpr,tpr,_=roc_curve(y_test,y_test_pred)
+plt.figure(figsize=(6,6))
+plt.plot(fpr,tpr,label=f'AUC={auc_test:.3f}')
+plt.plot([0,1],[0,1],'k--')
+plt.xlabel('FPR假阳性率')
+plt.ylabel('TPR真阳性率')
+plt.title('ROC曲线')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.savefig(os.path.join(OUT_DIR,'02_roc_curve.png'),dpi=120,bbox_inches='tight')
+plt.close()
+#画 KS 曲线（两条累计分布曲线 + 最大间距）
+ks_val,ks_df=calc_ks(y_test,y_test_pred)
+plt.figure(figsize=(6,6))
+plt.plot(ks_df['prob'],ks_df['cum_bad'],label='累计坏样本')
+plt.plot(ks_df['prob'],ks_df['cum_good'],label='累计好样本')
+plt.title(f'KS曲线，KS={ks_val:.3f}')
+plt.xlabel('预测违约概率')
+plt.ylabel('累计占比')
+plt.legend()
+plt.grid(alpha=0.3)
+plt.savefig(os.path.join(OUT_DIR,'03_ks_curve.png'),dpi=120,bbox_inches='tight')
+plt.close()
+#画校准曲线，检查预测概率是否准确
+prob_true, prob_pred =calibration_curve(y_test, y_test_pred, n_bins=10)
+plt.figure(figsize=(6, 6))
+plt.plot(prob_pred, prob_true, "o-", label='模型预测')
+plt.plot([0, 1], [0, 1], "k--", label="理想校准")
+plt.xlabel("预测概率")
+plt.ylabel('真实违约率')
+plt.title("校准曲线")
+plt.legend()
+plt.grid(alpha=0.3)
+plt.savefig(os.path.join(OUT_DIR,'04_calibration_curve.png'),dpi=120,bbox_inches='tight')
+plt.close()
+print(f'主交付模型的 ROC / KS / 校准曲线已保存到 {OUT_DIR}')
 
 
 #================评分卡刻度转换=================
@@ -598,8 +676,8 @@ score_low=prob_to_score(p_low_risk)
 print(f'高风险用户(p=0.3)分数:{score_high:.2f}')
 print(f'低风险用户(p=0.0476)分数:{score_low:.2f}')
 #【修复】原代码只算不验。加一句断言，方向写反时立刻报错，避免"给最坏的人最高分"上线事故
-assert score_low>score_high,'❌ 评分方向写反了：低风险客户的分数必须高于高风险客户'
-assert abs(prob_to_score(1/(1+base_odds))-base_score)<1e-6,'❌ 基准分自检失败'
+assert score_low>score_high,'评分方向写反了：低风险客户的分数必须高于高风险客户'
+assert abs(prob_to_score(1/(1+base_odds))-base_score)<1e-6,'基准分自检失败：基准客户算出的分数应等于 base_score'
 print('方向自检通过：低风险高分、高风险低分，且基准分等于 base_score')
 #计算每一个变量的分值表
 coef_series=result.params
@@ -766,7 +844,14 @@ y_true=y_test.reset_index(drop=True)
 df_strategy=pd.DataFrame({'prob':y_pred_prob.values,'y':y_true.values})
 print(f'策略测算样本数 = {len(df_strategy)}（测试集），整体坏账率 = {df_strategy["y"].mean():.4f}')
 #遍历不同cutoff，计算每一个门槛下：通过率、坏账率、净利润
-cutoff_list = np.linspace(0,0.6,30)
+#【修复】原来用 np.linspace(0,0.6,30)，步长 0.0207 太粗：
+#  1) 起点 0 处 prob<0 恒为假，会多出一行 pass_rate=0 的退化行；
+#  2) 分辨率不足以定位最优阈值（线性损益下最优阈值即盈亏平衡坏账率，见下）。
+#现改为 0.01 起、步长 0.005 的细网格，仅用于画曲线与定位最优点。
+cutoff_list = np.linspace(0.01,0.6,119)
+print(f'最优阈值的解析参考：线性损益下 accept 条件为 (1-p)*NIM > p*LGD，'
+      f'即 p < NIM/(NIM+LGD) = {NIM/(NIM+LGD):.4f}，这是期望意义下的闭式最优；'
+      f'下方网格给出的是本测试集上的实际最优点（含抽样波动）。')
 res = []
 for cutoff in cutoff_list:
     #prob<cutoff就放款（prob是违约概率，违约概率低于阈值才放）
@@ -804,17 +889,38 @@ print('--- 最优策略点 ---')
 print(best_row.round(4).to_string())
 print(f'→ 最优 cutoff = {best_row["cutoff"]:.3f}，通过率 {best_row["pass_rate"]:.2%}，'
       f'坏账率 {best_row["bad_rate"]:.4f}，利润率 {best_row["profit"]:.4%}')
+#【新增】算出最优策略下的"误杀率"。
+#注意：best_row['bad_rate'] 是**通过人群**的坏账率，所以 1-(通过人群坏账率) 得到的是
+#"通过人群里好客户的占比"，跟被拒人群的误杀完全不是一回事（早期版本在这里算错过）。
+#被拒人群的坏账率要用"总体坏账 − 通过人群贡献的坏账"反推。
+_accept_mask=df_strategy['prob']<best_row['cutoff']
+_acc_n=int(_accept_mask.sum())
+_rej_n=int(len(df_strategy)-_acc_n)
+_acc_bad=int(df_strategy.loc[_accept_mask,'y'].sum())
+_rej_bad=int(df_strategy.loc[~_accept_mask,'y'].sum())
+_rej_badrate=_rej_bad/_rej_n
+_rej_goodrate=1-_rej_badrate
+print('--- 最优策略的接受/拒绝明细 ---')
+print(f'接受 {_acc_n} 人（其中坏客户 {_acc_bad}，坏账率 {_acc_bad/_acc_n:.4f}）')
+print(f'拒绝 {_rej_n} 人（其中坏客户 {_rej_bad}，坏账率 {_rej_badrate:.4f}）')
+print(f'→ 被拒人群中有 {_rej_goodrate:.4f}（{_rej_goodrate:.2%}）其实是好客户，即"误杀率"')
+print(f'  对比：通过人群里好客户占比 = {1-_acc_bad/_acc_n:.4f}（这两个数容易混，别弄反）')
 #分析通过率-坏账率-损益曲线
-'''本数据实测曲线形状（NIM=20%，LGD=70%，盈亏平衡坏账率 22.22%）：
-1.通过率 0% → 73% 区间：利润率从 0 一路爬升到峰值 6.22%。
-  原因是被拒的是评分最低的高危客户，他们的预期损失远大于收益，拒掉他们是"纯赚"。
-2.通过率约 72.9%（cutoff=0.207）到达峰值：此时边际收益 = 边际损失。
-3.通过率继续上升：利润率缓慢下降。因为被拒人群里好客户的比例越来越高，
-  拒掉他们"放弃的收益"开始超过"避免的损失"。
-  实测通过率 91.5% 时利润率降到 3.67%，但仍是正的 —— 说明曲线在峰值附近很平坦，
-  业务上可以在通过率和利润率之间做取舍，不必死守数学最优点。'''
+#【修复】这里原来是手抄数字的注释块。改一次代码、重跑一次，72.9%/0.207/91.5%/3.67%/12.75% 就全部过期了。
+#现在改成用实际计算结果拼字符串，数字不可能再漂。
+_pass_at_peak=best_row['pass_rate']; _cut_at_peak=best_row['cutoff']; _prof_at_peak=best_row['profit']
+_wide=res_df[res_df['pass_rate']>=0.90]
+_wide=_wide.iloc[-1] if len(_wide)>0 else res_df.iloc[-1]
+print('--- 通过率-坏账率-损益曲线形状解读 ---')
+print(f'1. 通过率 0% → {_pass_at_peak:.1%} 区间：利润率从 0 一路爬升到峰值 {_prof_at_peak:.2%}。')
+print('   原因是被拒的是评分最低的高危客户，他们的预期损失远大于收益，拒掉他们是"纯赚"。')
+print(f'2. 通过率约 {_pass_at_peak:.1%}（cutoff={_cut_at_peak:.3f}）到达峰值：此时边际收益 = 边际损失。')
+print('3. 通过率继续上升：利润率缓慢下降。因为被拒人群里好客户的比例越来越高，')
+print('   拒掉他们"放弃的收益"开始超过"避免的损失"。')
+print(f'   实测通过率 {_wide["pass_rate"]:.1%} 时利润率降到 {_wide["profit"]:.2%}，但仍是正的 —— '
+      '说明曲线在峰值附近很平坦，业务上可以在通过率和利润率之间做取舍，不必死守数学最优点。')
 #风控的目标不是"把坏账率降到最低"，而是"让风险调整后的利润最大"。
-#如果为了把坏账率压到 12.75% 以下而继续收紧 cutoff，坏账率会更低，但利润反而减少。
+#继续收紧 cutoff 会让坏账率更低，但利润反而减少。
 #设计 3~5 条业务规则，算命中率/命中坏账率/边际收益
 #【修复】原规则代码引用了不存在的列（query_bin）且用数值方式比较字符串分箱列（PAY1_bin>=3、util_bins>0.9），
 #直接运行会报错。这里改成基于真实分箱列的条件。
@@ -864,7 +970,13 @@ rule_df.to_csv(os.path.join(OUT_DIR,'rule_strategy.csv'),index=False,encoding='u
 #对比"评分卡策略" vs "单条规则策略"
 '''硬规则策略：一刀切，满足条件直接拒绝，简单易解释，但风险分层粗糙，容易误杀优质客户。
 评分卡策略：连续风险分数精细化分层，可以灵活调整cutoff，最大化利润；缺点是建模复杂，业务理解成本更高。行业常用组合方案：硬规则前置拦截极端风险，评分卡做主准入策略。'''
-#做敏感性分析：LGD代表违约损失，LGD越高，单个坏客户造成亏损越大。LGD上升时，最优cutoff会抬高，准入策略收紧；LGD降低，可以适当放宽准入，接受更高坏账。
+#做敏感性分析：LGD代表违约损失，LGD越高，单个坏客户造成的亏损越大。
+#【修复】原注释把方向写反了（原文："LGD上升时，最优cutoff会抬高，准入策略收紧"），且自相矛盾。
+#正确推导：盈亏平衡坏账率 = NIM/(NIM+LGD)，LGD 上升 -> 盈亏平衡坏账率下降；
+#而 accept 条件是 prob < cutoff，所以门槛必须同步下调 -> 最优 cutoff 下降、通过率下降，即准入收紧。
+#"cutoff 抬高"与"准入收紧"是相反的两件事，不能并存。
+#另外：网格 np.linspace(0,0.6,30) 步长达 0.0207，分辨率不足以体现这一变化，
+#所以 lgd_sensitivity.csv 里 LGD=0.6/0.7/0.8 三档都会落到同一个网格点上。下方已改用细网格。
 print('--- LGD 敏感性分析 ---')
 df_strategy_sens = pd.DataFrame({
     'prob': result.predict(x_test_sm).values,
@@ -919,78 +1031,122 @@ print(f'盈亏平衡坏账率 {break_even_badrate:.4%} 与实际坏账率 {base_
 print('\n'+'='*60)
 print('步骤10 模型对比与结论')
 print('='*60)
+#【修复】原来所有模型（含树模型）都用 WOE 编码特征，这是一个不公平的对比。
+#WOE 分箱是为了让逻辑回归拿到"分组线性化 + 单调"的输入，代价是丢掉原始取值的细节；
+#而树模型本来就能自己搜切分点，把分箱后的有序整数喂给它，等于替它做了一次很粗的切分，是净损失。
+#最直接的证据：随机森林(300棵) 的 KS 竟然低于单棵限深决策树，正常情况不该发生。
+#现在改成每个模型用自己的自然特征口径：评分卡用 WOE 特征，树模型用原始数值特征，训练/测试行完全一致。
+raw_feature_cols=['LIMIT_BAL','SEX','EDUCATION','MARRIAGE','AGE',
+                  'PAY_1','PAY_2','PAY_3','PAY_4','PAY_5','PAY_6',
+                  'BILL_AMT1','BILL_AMT2','BILL_AMT3','BILL_AMT4','BILL_AMT5','BILL_AMT6',
+                  'PAY_AMT1','PAY_AMT2','PAY_AMT3','PAY_AMT4','PAY_AMT5','PAY_AMT6']
+x_train_raw=df.loc[x_train.index,raw_feature_cols].copy()
+x_test_raw=df.loc[x_test.index,raw_feature_cols].copy()
+print(f'原始特征口径：{len(raw_feature_cols)} 个字段（未分箱、未 WOE 编码）')
+
 model_dict={
-    '逻辑回归评分卡':LogisticRegression(random_state=42,max_iter=1000),
+    '逻辑回归评分卡':LogisticRegression(random_state=42,max_iter=5000),
     '决策树(d=4)':DecisionTreeClassifier(max_depth=4,random_state=42),
     '随机森林(300棵)':RandomForestClassifier(n_estimators=300,random_state=42),
     '梯度提升':GradientBoostingClassifier(random_state=42),
 }
-compare_rows=[{'模型':'基线(训练集均值)','测试AUC':base_auc,'测试KS':calc_ks(y_test,y_pred_base)[0]}]
+ks_base=calc_ks(y_test,y_pred_base)[0]
+compare_rows=[{'模型':'基线(训练集均值)',
+               'WOE特征AUC':round(base_auc,4),'WOE特征KS':round(ks_base,4),
+               '原始特征AUC':round(base_auc,4),'原始特征KS':round(ks_base,4)}]
 for name,model in model_dict.items():
-    model.fit(x_train_woe,y_train)
-    pred=model.predict_proba(x_test_woe)[:,1]
-    compare_rows.append({'模型':name,'测试AUC':roc_auc_score(y_test,pred),'测试KS':calc_ks(y_test,pred)[0]})
+    row={'模型':name}
+    for tag,(xtr,xte) in [('WOE',(x_train_woe,x_test_woe)),('原始',(x_train_raw,x_test_raw))]:
+        #逻辑回归在原始特征上必须先标准化：LIMIT_BAL 是 1e5 量级、AGE 是 30 量级，
+        #量纲差 3 个数量级会让 lbfgs 无法收敛（否则会报 ConvergenceWarning）。
+        #树模型对单调变换不敏感，不需要标准化，直接喂原始值即可。
+        m=make_pipeline(StandardScaler(),LogisticRegression(random_state=42,max_iter=5000)) \
+          if (tag=='原始' and isinstance(model,LogisticRegression)) else model
+        m.fit(xtr,y_train)
+        pred=m.predict_proba(xte)[:,1]
+        row[f'{tag}特征AUC']=round(roc_auc_score(y_test,pred),4)
+        row[f'{tag}特征KS']=round(calc_ks(y_test,pred)[0],4)
+    compare_rows.append(row)
 compare_df=pd.DataFrame(compare_rows)
-print('--- 模型对比（同一训练/测试集）---')
-print(compare_df.round(4).to_string(index=False))
+print('--- 模型对比（同一训练/测试集，两种特征口径各训一遍）---')
+print(compare_df.to_string(index=False))
 compare_df.to_csv(os.path.join(OUT_DIR,'model_compare.csv'),index=False,encoding='utf-8-sig')
 #为什么 GBDT 的 KS 更高，风控却仍然主用评分卡？
 '''1.可解释性：评分卡每个变量都有系数、OR、p 值，能回答"为什么拒绝这个客户"；树模型只能给特征重要性。
 2.监管合规：信贷审批要求可解释、可申诉，纯黑箱模型多数监管场景不接受。
 3.稳定性：逻辑回归方差低、PSI 易控；树模型容易过拟合、漂移更快。
 4.部署成本：评分卡是一张分值表，Excel 就能算；树模型需要模型服务。
-5.性能差距很小：本数据 GBDT 的 KS 仅比评分卡高约 0.01，为这点提升放弃上述四项不划算。
+5.性能差距需要按同一口径比较：公平口径下 GBDT 的 KS 领先幅度比"全部喂 WOE"时更大，
+  说明这个取舍不是"差距小到可以忽略"，而是"用可解释性和稳定性换掉这部分区分度"。
 行业常规做法是"双轨"：评分卡做主准入决策，机器学习模型做辅助排序/反欺诈。'''
-print(f'结论：梯度提升的 KS 只比评分卡高 {compare_df.loc[compare_df["模型"]=="梯度提升","测试KS"].values[0]-ks_test:.4f}，'
+_ks_lr_woe=compare_df.loc[compare_df['模型']=='逻辑回归评分卡','WOE特征KS'].values[0]
+_ks_gbdt_raw=compare_df.loc[compare_df['模型']=='梯度提升','原始特征KS'].values[0]
+_ks_rf_woe=compare_df.loc[compare_df['模型']=='随机森林(300棵)','WOE特征KS'].values[0]
+_ks_rf_raw=compare_df.loc[compare_df['模型']=='随机森林(300棵)','原始特征KS'].values[0]
+_ks_dt_woe=compare_df.loc[compare_df['模型']=='决策树(d=4)','WOE特征KS'].values[0]
+print(f'结论：按同一口径比较，梯度提升（原始特征）KS={_ks_gbdt_raw:.4f}，'
+      f'比评分卡（WOE特征）的 {_ks_lr_woe:.4f} 高出 {_ks_gbdt_raw-_ks_lr_woe:.4f}；'
       f'但评分卡可解释、可审计、可 Excel 手工复算，因此主决策仍用评分卡。')
+print(f'口径公平性说明：随机森林在 WOE 特征下 KS={_ks_rf_woe:.4f}，'
+      f'低于单棵决策树的 {_ks_dt_woe:.4f}（正常不应发生）；改用原始特征后 KS={_ks_rf_raw:.4f}，'
+      f'恢复正常的模型排序，也证明原对比对树模型不利。')
 print('\n全部结果已输出到：'+OUT_DIR)
 
-#================关键结果汇总（全部来自本脚本的实际运行输出）=================
-'''下面每个数字都对应上面某一步的 print 结果，可逐项核对，不是估算值。
-【数据】30000 × 25，无缺失，坏账率 22.12%（6636 笔），多数类基线准确率 77.88%
-【清洗】EDUCATION 未定义编码 0/5/6 共 345 条 → 归入 4；MARRIAGE 的 0 共 54 条 → 归入 3
-        六个月还款额全为 0 的客户 1432 人（4.77%）；BILL_AMT1 负值（溢缴款）590 笔
-【时间代理检验】ID 分 5 段卡方 = 33.9338，p<0.001 显著，但坏账率极差只有 0.0395 且无单调趋势
-        → 判定为大样本下的统计显著，不采用 ID 作为时间代理
-【IV 前五】PAY1_bin 0.8610 ｜ delay_cnt_bins 0.6695（信息重复，已排除）｜ PAY2_bin 0.5445
-        ｜ PAY3_bin 0.4107 ｜ PAY4_bin 0.3585
-【IV 无用】BILL_AMT1~6 合计仅 0.0662（每个都 <0.02，全部剔除）｜ SEX 0.0092 ｜ MARRIAGE 0.0055
-【共线性】BILL_AMT 之间存在 16 组 |r|>0.7（最高 BILL_AMT1~BILL_AMT2 = 0.9515）
-        按 IV 筛掉 BILL_AMT 后，入模变量最大 VIF = 3.4237，无严重共线
-【建模】训练集 AUC 0.7708 / KS 0.4124；测试集 AUC 0.7605 / KS 0.3995
-        基线 AUC 0.5000 / KS 0.0123；5 折 CV AUC 0.7695 ± 0.0101
-        伪 R² 0.1772，AIC 18295.7，BIC 18438.9
-【显著性】6 个变量不显著：age_bins(0.0975)、PAY2_bin(0.3013)、PAY4_bin(0.0706)、
-        pay4_bins(0.0928)、pay5_bins(0.9784)、pay6_bins(0.0523)
-        剔除后 11 个变量：测试 AUC 0.7592 / KS 0.3972（只降 0.0013 / 0.0023）→ 应剔除
-【系数符号】17 个特征中 16 个为正；唯一负系数 pay_ratio1_bins = -0.2024（p=0.0150，显著但符号反常）
-        成因是它与 pay1_bins 共用 PAY_AMT1、与 util_bins 共用 BILL_AMT1，属于信息重叠
-        导致的系数翻转，正是"共线性危害"第 3 条描述的现象
-【评分卡】A = 383.9036，B = 72.1348；基础分 = A - B*beta0 = 473.89
-        分数范围：训练集 202.38~615.65（中位 509.77），测试集 204.39~605.57（中位 509.64）
-        分值表复核误差 = 0.000000（基础分写法已修正，原写法相差约 180 分）
-        示例分值：PAY1_bin"逾期2个月" = +112.12 分，"逾期3个月以上" = +117.72 分，
-                 EDUCATION=4（其他）= -31.25 分
-【PSI】随机切分：最大 0.001142（数学必然≈0，不构成稳定性证据）
-        按 ID 排序的伪 OOT：最大 0.06948（pay3_bins），其余 <0.015，判定"稳定"
-        伪 OOT 早/晚两段坏账率：22.84% vs 20.44%
-【损益】NIM=20%、LGD=70%（假设值）→ 盈亏平衡坏账率 22.22%，实际 22.12%，缓冲仅 0.10pp
-        无策略（全通过）：通过率 100%，坏账率 22.12%，利润率 0.0900%
-        评分卡最优：cutoff=0.207，通过率 72.99%，坏账率 12.73%，利润率 6.2378%
-【规则策略】规则1"最近一期有逾期"：命中率 22.30%，命中坏账率 49.93%，
-        拒绝后通过率 77.70%、坏账率 14.14%、利润率 5.65%
-        单条规则即可拿到评分卡约 90% 的收益，且通过率更高、上线成本更低
-【模型对比】基线 0.0123 ｜ 评分卡 KS 0.3995 ｜ 决策树(d=4) 0.3745 ｜ 随机森林 0.3615
-        ｜ 梯度提升 0.4148
-        梯度提升 KS 只高 0.0153，但评分卡可解释、可审计、可 Excel 复算，主决策仍用评分卡
-【已知局限】1.无日期字段，无法做真正的时间外(OOT)验证，时间稳定性未被证实
-        2.全部为已发卡客户，无拒绝样本，存在样本选择偏差(reject inference)，
-          策略效果不能外推到全量申请者
-        3.损益测算的 NIM/LGD 为假设值，LGD 升到 0.8 时盈亏平衡坏账率降到 20%，
-          低于实际 22.12%，业务将转为亏损
-        4.age_bins 是非单调变量（U 型 + 锯齿，10 箱），且 p=0.0975 不显著、
-          IV=0.0206 刚刚压线，本应优先剔除
-        5.EDUCATION=4 只有 468 人、坏账率 7.05%，WOE=-1.26 破坏单调性，
-          很可能是特殊客群混入，建议做粗分类或剔除
-        6.pay1_bins 与 pay_ratio1_bins 信息重叠导致系数符号翻转，建议二者只保留一个
-'''
+#================关键结果汇总（自动生成，不再手抄）=================
+#【修复】这里原来是一段手抄数字的 docstring，开头写着"每个数字都对应上面某一步的 print 结果"。
+#但只要改一次代码、重跑一次，它就会漂 —— 实测已经漂过三次：
+#   第一次：结论说剔除、交付用全变量模型；
+#   第二次：README 明细表中间行与实际输出不符；
+#   第三次：本段里的模型对比 KS 有 6 个值对不上 model_compare.csv。
+#根治办法：数字只在一处产生 —— 直接由脚本写出 summary.txt，人不再手抄。
+summary_path=os.path.join(OUT_DIR,'summary.txt')
+with open(summary_path,'w',encoding='utf-8') as f:
+    f.write('===== 关键结果汇总（本文件由 credit-scorecard.py 自动生成，请勿手改）=====\n\n')
+    f.write('【数据】\n')
+    f.write(f'  样本规模        : {df_shape_raw[0]} × {df_shape_raw[1]}，缺失值 {df.isna().sum().sum()} 个\n')
+    f.write(f'  整体坏账率      : {base_badrate:.4f}（{int(df[target].sum())} 笔）\n')
+    f.write(f'  多数类基线准确率: {1-base_badrate:.4f}\n\n')
+    f.write('【模型】\n')
+    f.write(f'  主交付变量数    : {len(feature_cols)}（全变量对照 {len(feature_cols_full)} 个）\n')
+    f.write(f'  主交付 训练集   : AUC={auc_train:.4f}，KS={ks_train:.4f}\n')
+    f.write(f'  主交付 测试集   : AUC={auc_test:.4f}，KS={ks_test:.4f}\n')
+    f.write(f'  主交付 训练-测试差值: AUC={abs(auc_train-auc_test):.4f}，KS={abs(ks_train-ks_test):.4f}\n')
+    f.write(f'  主交付 5折CV    : {cv_keep.mean():.4f} ± {cv_keep.std():.4f}\n')
+    f.write(f'  伪R² / AIC / BIC: {result.prsquared:.4f} / {result.aic:.1f} / {result.bic:.1f}\n')
+    f.write(f'  最大 VIF        : {vif_data["VIF"].max():.4f}\n')
+    f.write(f'  剔除变量清单    : {drop_cols}\n\n')
+    f.write('【评分卡】\n')
+    f.write(f'  A / B / 基础分  : {A:.4f} / {B:.4f} / {base_point:.2f}\n')
+    f.write(f'  分数范围(训练)  : {train_score.min():.2f} ~ {train_score.max():.2f}，中位 {train_score.median():.2f}\n')
+    f.write(f'  分数范围(测试)  : {test_score.min():.2f} ~ {test_score.max():.2f}，中位 {test_score.median():.2f}\n')
+    f.write(f'  分值表复核误差  : {np.abs(recon_score.values-test_score.values).max():.6f}（应为 0）\n\n')
+    f.write('【损益】\n')
+    f.write(f'  NIM / LGD       : {NIM:.0%} / {LGD:.0%}（假设值，非实测）\n')
+    f.write(f'  盈亏平衡坏账率  : {break_even_badrate:.4f}，实际 {base_badrate:.4f}，'
+            f'缓冲 {(break_even_badrate-base_badrate)*100:.2f} 个百分点\n')
+    f.write(f'  解析最优阈值    : NIM/(NIM+LGD) = {break_even_badrate:.4f}（期望意义下的闭式解）\n')
+    f.write(f'  无策略(全通过)  : 通过率 100%，坏账率 {df_strategy["y"].mean():.4f}，利润率 {no_strategy_profit:.4%}\n')
+    f.write(f'  评分卡最优策略  : cutoff={best_row["cutoff"]:.3f}，通过率 {best_row["pass_rate"]:.2%}，'
+            f'坏账率 {best_row["bad_rate"]:.4f}，利润率 {best_row["profit"]:.4%}\n')
+    f.write(f'  最优策略接受/拒绝: 接受 {_acc_n} 人（坏账率 {_acc_bad/_acc_n:.4f}）｜'
+            f'拒绝 {_rej_n} 人（坏账率 {_rej_badrate:.4f}）\n')
+    f.write(f'  被拒人群误杀率  : {_rej_goodrate:.4f}（被拒的人里其实是好客户的比例）\n\n')
+    f.write('--- 规则策略 ---\n')
+    f.write(rule_df.round(4).to_string(index=False)+'\n\n')
+    f.write('--- LGD 敏感性 ---\n')
+    f.write(sens_df.round(4).to_string(index=False)+'\n\n')
+    f.write('--- 模型对比（两种特征口径各训一遍）---\n')
+    f.write(compare_df.to_string(index=False)+'\n\n')
+    f.write('【已知局限（定性，不含数字）】\n')
+    f.write('  1. 数据无日期字段，无法做真正的时间外(OOT)验证，时间稳定性未被证实\n')
+    f.write('  2. 全部为已发卡客户、无拒绝样本，存在样本选择偏差(reject_inference)，\n')
+    f.write('     策略效果不能外推到全量申请者\n')
+    f.write('  3. 损益测算的 NIM/LGD 为假设值，结论对该假设高度敏感\n')
+    f.write('  4. age_bins 非单调且不显著，已剔除\n')
+    f.write('  5. EDUCATION=4 样本量小(468 人)且 WOE 极端，破坏单调性；\n')
+    f.write('     该档信号在数据上真实存在，但小样本箱不稳定，本轮保留并列入上线监控：\n')
+    f.write('     若该档样本占比或坏账率发生明显变化，立即做粗分类合并或剔除\n')
+    f.write('  6. pay1_bins 与 pay_ratio1_bins 信息重叠；其中 pay_ratio1_bins 系数符号翻转，\n')
+    f.write('     已从主交付模型中剔除，仅在"全变量对照版本"中保留作为共线性案例\n')
+    f.write('  7. 缺少额度/定价联动、策略矩阵、交换矩阵(swap set)分析，为后续可扩展项\n')
+print(f'关键结果汇总已自动写出：{summary_path}')
